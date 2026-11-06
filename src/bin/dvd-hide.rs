@@ -1,4 +1,4 @@
-//! 单文件 DVD 镜像隐写：把数据藏进 dis 镜像 / 从镜像取回。Rust 移植自 dvd_hide.py。
+//! 单文件 DVD 镜像数据填充：把数据直接填入 dis 镜像 / 从镜像取回。Rust 移植自 dvd_hide.py。
 //!
 //! 用法:
 //!     dvd-hide embed    DIS_ISO  DATA_FILE  OUTPUT_IMAGE  [--offset N]
@@ -448,7 +448,7 @@ fn run() -> i32 {
                         total / SECTOR as u64
                     );
                     println!("可用槽位（非 A5/92/9B 的字节数）: {slots}");
-                    println!("预估可藏数据大小: 约 {est} 字节（{:.3} MiB）", est as f64 / 1048576.0);
+                    println!("预估可填充数据大小: 约 {est} 字节（{:.3} MiB）", est as f64 / 1048576.0);
                     println!("  （= 槽位 - 12 字节头 - 约 1/64 转义膨胀；实际取决于数据分布）");
                 }
                 Err(e) => {

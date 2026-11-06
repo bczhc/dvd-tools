@@ -3,10 +3,6 @@ name = "dvd-tools"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "dsv-balancer"
-path = "src/bin/dsv_balancer.rs"
-
 [dependencies]
 aes = "0.8"
 clap = { version = "4", features = ["derive"] }
