@@ -1,0 +1,18 @@
+[package]
+name = "dvd-tools"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dsv-balancer"
+path = "src/bin/dsv_balancer.rs"
+
+[dependencies]
+aes = "0.8"
+clap = { version = "4", features = ["derive"] }
+ctr = "0.9"
+rayon = "1.10"
+
+[profile.release]
+lto = true
+codegen-units = 1
