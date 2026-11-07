@@ -1,14 +1,16 @@
 //! 单文件 DVD 镜像数据填充：把数据直接填入 dis 镜像 / 从镜像取回。Rust 移植自 dvd_hide.py。
 //!
 //! 用法:
-//!     dvd-hide embed    DIS_ISO  DATA_FILE  OUTPUT_IMAGE  [--offset N]
-//!     dvd-hide extract  IMAGE_FILE  OUTPUT_DATA           [--offset N]
-//!     dvd-hide capacity DIS_ISO                            [--offset N]
+//!     dvd-hide embed    DIS_ISO  DATA_FILE  OUTPUT_IMAGE
+//!     dvd-hide extract  IMAGE_FILE             (数据写到 stdout)
+//!     dvd-hide capacity DIS_ISO
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
+use std::path::{Path, PathBuf};
 
 use aes::Aes256;
+use clap::{Parser, Subcommand};
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use dvd_tools::{SECTOR, masks, preset_index};
 
@@ -100,21 +102,23 @@ fn escape(data: &[u8], label: Option<&str>, prog: &mut Progress) -> Vec<u8> {
 // ---------------- 进度条（写 stderr） ----------------
 struct Progress {
     tty: bool,
+    quiet: bool,
     bar_active: bool,
     last_bucket: i64,
 }
 
 impl Progress {
-    fn new() -> Self {
+    fn new(quiet: bool) -> Self {
         Progress {
             tty: io::stderr().is_terminal(),
+            quiet,
             bar_active: false,
             last_bucket: -1,
         }
     }
 
     fn update(&mut self, done: u64, total: u64, label: &str) {
-        if total == 0 {
+        if self.quiet || total == 0 {
             return;
         }
         if self.tty {
@@ -144,9 +148,9 @@ impl Progress {
 }
 
 // ---------------- 正向 ----------------
-fn embed(dis_path: &str, data: Vec<u8>, out_path: &str, offset: i64) -> Result<(usize, usize, usize), String> {
+fn embed(dis_path: &Path, data: Vec<u8>, out_path: &Path, quiet: bool) -> Result<(usize, usize, usize), String> {
     let masks = masks();
-    let mut prog = Progress::new();
+    let mut prog = Progress::new(quiet);
 
     let n = data.len();
     let mut b = data;
@@ -188,7 +192,7 @@ fn embed(dis_path: &str, data: Vec<u8>, out_path: &str, offset: i64) -> Result<(
         let n_sectors = buf.len() / SECTOR;
 
         for j in 0..n_sectors {
-            let mask = &masks[preset_index(offset, si0 + j as i64)];
+            let mask = &masks[preset_index(0, si0 + j as i64)];
             let base = j * SECTOR;
             for i in 0..SECTOR {
                 let raw = buf[base + i];
@@ -219,18 +223,22 @@ fn embed(dis_path: &str, data: Vec<u8>, out_path: &str, offset: i64) -> Result<(
 }
 
 // ---------------- 逆向 ----------------
-fn extract(image_path: &str, out_path: &str, offset: i64) -> Result<usize, String> {
+fn extract(image_path: &Path, quiet: bool) -> Result<usize, String> {
     let masks = masks();
-    let mut prog = Progress::new();
+    let mut prog = Progress::new(quiet);
 
-    let total_size = std::fs::metadata(image_path).map_err(|e| e.to_string())?.len();
-    let fin = File::open(image_path).map_err(|e| e.to_string())?;
+    // 设备（如 /dev/sr0）的 size 是 0，拿不到就当 0（进度条不显示）。
+    let total_size = std::fs::metadata(image_path).map(|m| m.len()).unwrap_or(0);
+    let fin = File::open(image_path).map_err(|e| format!("错误: 打开 {} 失败: {e}", image_path.display()))?;
     let mut reader = BufReader::new(fin);
+    let mut out = io::stdout().lock();
 
-    let mut out: Vec<u8> = Vec::new();
+    let mut header: Vec<u8> = Vec::with_capacity(HEADER_LEN);
+    let mut remaining = 0usize; // 还需解密的密文字节数
+    let mut data_len = 0usize;
+    let mut cipher: Option<Aes256Ctr> = None;
+    let mut decrypt_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut pending = false;
-    let mut length: Option<u64> = None;
-    let mut needed = HEADER_LEN;
 
     let mut si0: i64 = 0;
     let mut read_bytes = 0u64;
@@ -238,7 +246,7 @@ fn extract(image_path: &str, out_path: &str, offset: i64) -> Result<usize, Strin
 
     loop {
         buf.resize(CHUNK_SIZE, 0);
-        let nread = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        let nread = reader.read(&mut buf).map_err(|e| format!("错误: 读取失败: {e}"))?;
         if nread == 0 {
             break;
         }
@@ -251,48 +259,64 @@ fn extract(image_path: &str, out_path: &str, offset: i64) -> Result<usize, Strin
         let n_sectors = buf.len() / SECTOR;
 
         for j in 0..n_sectors {
-            let mask = &masks[preset_index(offset, si0 + j as i64)];
+            let mask = &masks[preset_index(0, si0 + j as i64)];
             let base = j * SECTOR;
             for i in 0..SECTOR {
                 let d = buf[base + i] ^ mask[i];
                 if is_special(d) {
                     continue;
                 }
-                if pending {
-                    let val = match d {
+
+                // 反转义出一个字节 b
+                let b = if pending {
+                    pending = false;
+                    match d {
                         0x00 => 0xA5,
                         0x01 => 0x92,
                         0x02 => 0x9B,
                         0x5C => 0x5C,
                         _ => return Err(format!("错误: 非法转义序列 5C {:02x}（镜像可能损坏）", d)),
-                    };
-                    out.push(val);
-                    pending = false;
+                    }
                 } else if d == ESC {
                     pending = true;
+                    continue;
                 } else {
-                    out.push(d);
-                }
+                    d
+                };
 
-                if length.is_none() && out.len() >= HEADER_LEN {
-                    if &out[..MAGIC.len()] != MAGIC {
-                        return Err(
-                            "错误: 镜像里没有数据魔数（不是本程序嵌入的镜像，或 --offset 不对）".to_string(),
-                        );
+                if header.len() < HEADER_LEN {
+                    header.push(b);
+                    if header.len() == HEADER_LEN {
+                        if &header[..MAGIC.len()] != MAGIC {
+                            return Err(
+                                "错误: 镜像里没有数据魔数（不是本程序嵌入的镜像，或 --offset 不对）".to_string(),
+                            );
+                        }
+                        let mut le = [0u8; 8];
+                        le.copy_from_slice(&header[MAGIC.len()..HEADER_LEN]);
+                        data_len = u64::from_le_bytes(le) as usize;
+                        remaining = data_len;
+                        cipher = Some(Aes256Ctr::new(&KEY.into(), &ctr_iv().into()));
+                        if remaining == 0 {
+                            out.flush().map_err(|e| format!("错误: 写 stdout 失败: {e}"))?;
+                            prog.end();
+                            return Ok(0);
+                        }
                     }
-                    let mut le = [0u8; 8];
-                    le.copy_from_slice(&out[MAGIC.len()..HEADER_LEN]);
-                    let l = u64::from_le_bytes(le);
-                    length = Some(l);
-                    needed = HEADER_LEN.saturating_add(l as usize);
-                }
-
-                if length.is_some() && out.len() >= needed {
-                    prog.end();
-                    let mut data = out[HEADER_LEN..needed].to_vec();
-                    scramble(&mut data, Some("解密中"), &mut prog); // CTR 自逆
-                    std::fs::write(out_path, &data).map_err(|e| e.to_string())?;
-                    return Ok(data.len());
+                } else {
+                    // 密文字节：流式解密并写到 stdout
+                    decrypt_buf.push(b);
+                    remaining -= 1;
+                    if decrypt_buf.len() >= 64 * 1024 || remaining == 0 {
+                        cipher.as_mut().unwrap().apply_keystream(&mut decrypt_buf);
+                        out.write_all(&decrypt_buf).map_err(|e| format!("错误: 写 stdout 失败: {e}"))?;
+                        decrypt_buf.clear();
+                    }
+                    if remaining == 0 {
+                        out.flush().map_err(|e| format!("错误: 写 stdout 失败: {e}"))?;
+                        prog.end();
+                        return Ok(data_len);
+                    }
                 }
             }
         }
@@ -305,9 +329,9 @@ fn extract(image_path: &str, out_path: &str, offset: i64) -> Result<usize, Strin
 }
 
 // ---------------- 容量 ----------------
-fn capacity(dis_path: &str, offset: i64) -> Result<(u64, u64), String> {
+fn capacity(dis_path: &Path, quiet: bool) -> Result<(u64, u64), String> {
     let masks = masks();
-    let mut prog = Progress::new();
+    let mut prog = Progress::new(quiet);
 
     let total_size = std::fs::metadata(dis_path).map_err(|e| e.to_string())?.len();
     let fin = File::open(dis_path).map_err(|e| e.to_string())?;
@@ -334,7 +358,7 @@ fn capacity(dis_path: &str, offset: i64) -> Result<(u64, u64), String> {
         let n_sectors = buf.len() / SECTOR;
 
         for j in 0..n_sectors {
-            let mask = &masks[preset_index(offset, si0 + j as i64)];
+            let mask = &masks[preset_index(0, si0 + j as i64)];
             let base = j * SECTOR;
             for i in 0..SECTOR {
                 let a = buf[base + i] ^ mask[i];
@@ -353,118 +377,86 @@ fn capacity(dis_path: &str, offset: i64) -> Result<(u64, u64), String> {
 }
 
 // ---------------- 命令行 ----------------
-fn usage() {
-    eprintln!("用法:");
-    eprintln!("  dvd-hide embed    DIS_ISO  DATA_FILE  OUTPUT_IMAGE  [--offset N]");
-    eprintln!("  dvd-hide extract  IMAGE_FILE  OUTPUT_DATA           [--offset N]");
-    eprintln!("  dvd-hide capacity DIS_ISO                            [--offset N]");
+#[derive(Parser)]
+#[command(name = "dvd-hide", version, about = "单文件 DVD 镜像数据填充")]
+struct Cli {
+    /// 不显示进度
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
+    #[command(subcommand)]
+    command: Command,
 }
 
-fn parse_int(s: &str) -> i64 {
-    s.parse().unwrap_or_else(|_| {
-        eprintln!("错误: 无法解析整数: {s}");
-        std::process::exit(2);
-    })
+#[derive(Subcommand)]
+enum Command {
+    /// 把数据直接填入 dis 镜像
+    Embed {
+        /// 载体镜像
+        dis: PathBuf,
+        /// 要填入的数据文件
+        data: PathBuf,
+        /// 输出镜像文件
+        output: PathBuf,
+    },
+    /// 从镜像取回数据（写到 stdout）
+    Extract {
+        /// 含数据的镜像（可以是设备，如 /dev/sr0）
+        image: PathBuf,
+    },
+    /// 预估能填充多少数据
+    Capacity {
+        /// 载体镜像
+        dis: PathBuf,
+    },
 }
 
-fn run() -> i32 {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        usage();
-        return 2;
-    }
-
-    let cmd = args[1].as_str();
-    let mut positionals: Vec<String> = Vec::new();
-    let mut offset: i64 = 0;
-
-    let mut i = 2;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if a == "--offset" {
-            i += 1;
-            if i >= args.len() {
-                eprintln!("错误: --offset 需要一个整数");
-                return 2;
-            }
-            offset = parse_int(&args[i]);
-        } else if let Some(v) = a.strip_prefix("--offset=") {
-            offset = parse_int(v);
-        } else {
-            positionals.push(a.to_string());
-        }
-        i += 1;
-    }
-
-    match cmd {
-        "embed" => {
-            if positionals.len() != 3 {
-                usage();
-                return 2;
-            }
-            let (dis, data, output) = (&positionals[0], &positionals[1], &positionals[2]);
-            let data_bytes = match std::fs::read(data) {
+fn main() {
+    let cli = Cli::parse();
+    let quiet = cli.quiet;
+    match cli.command {
+        Command::Embed { dis, data, output } => {
+            let data_bytes = match std::fs::read(&data) {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("错误: 读取数据文件失败: {e}");
-                    return 1;
+                    std::process::exit(1);
                 }
             };
-            match embed(dis, data_bytes, output, offset) {
+            match embed(&dis, data_bytes, &output, quiet) {
                 Ok((n, nb, nc)) => {
-                    println!("完成: {dis} + {data} -> {output}");
+                    println!("完成: {} + {} -> {}", dis.display(), data.display(), output.display());
                     println!("  数据 {n} 字节 → B {nb} 字节 → C {nc} 字节");
                 }
                 Err(e) => {
                     eprintln!("{e}");
-                    return 1;
+                    std::process::exit(1);
                 }
             }
         }
-        "extract" => {
-            if positionals.len() != 2 {
-                usage();
-                return 2;
+        Command::Extract { image } => match extract(&image, quiet) {
+            Ok(n) => eprintln!("完成: 从 {} 提取 {n} 字节（写到 stdout）", image.display()),
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
             }
-            match extract(&positionals[0], &positionals[1], offset) {
-                Ok(n) => println!("完成: {} -> {}（{n} 字节）", positionals[0], positionals[1]),
-                Err(e) => {
-                    eprintln!("{e}");
-                    return 1;
-                }
+        },
+        Command::Capacity { dis } => match capacity(&dis, quiet) {
+            Ok((slots, total)) => {
+                let est = (slots as i128 * 64 / 65) - HEADER_LEN as i128;
+                println!(
+                    "镜像: {}（{total} 字节，{} 扇区）",
+                    dis.display(),
+                    total / SECTOR as u64
+                );
+                println!("可用槽位（非 A5/92/9B 的字节数）: {slots}");
+                println!("预估可填充数据大小: 约 {est} 字节（{:.3} MiB）", est as f64 / 1048576.0);
+                println!("  （= 槽位 - 12 字节头 - 约 1/64 转义膨胀；实际取决于数据分布）");
             }
-        }
-        "capacity" => {
-            if positionals.len() != 1 {
-                usage();
-                return 2;
+            Err(e) => {
+                eprintln!("{e}");
+                std::process::exit(1);
             }
-            match capacity(&positionals[0], offset) {
-                Ok((slots, total)) => {
-                    let est = (slots as i128 * 64 / 65) - HEADER_LEN as i128;
-                    println!(
-                        "镜像: {}（{total} 字节，{} 扇区）",
-                        positionals[0],
-                        total / SECTOR as u64
-                    );
-                    println!("可用槽位（非 A5/92/9B 的字节数）: {slots}");
-                    println!("预估可填充数据大小: 约 {est} 字节（{:.3} MiB）", est as f64 / 1048576.0);
-                    println!("  （= 槽位 - 12 字节头 - 约 1/64 转义膨胀；实际取决于数据分布）");
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    return 1;
-                }
-            }
-        }
-        _ => {
-            usage();
-            return 2;
-        }
+        },
     }
-    0
-}
-
-fn main() {
-    std::process::exit(run());
 }
