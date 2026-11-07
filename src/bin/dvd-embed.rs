@@ -1,9 +1,9 @@
 //! 单文件 DVD 镜像数据填充：把数据直接填入 dis 镜像 / 从镜像取回。Rust 移植自 dvd_hide.py。
 //!
 //! 用法:
-//!     dvd-hide embed    DIS_ISO  DATA_FILE  OUTPUT_IMAGE
-//!     dvd-hide extract  IMAGE_FILE             (数据写到 stdout)
-//!     dvd-hide capacity DIS_ISO
+//!     dvd-embed embed    DIS_ISO  DATA_FILE  OUTPUT_IMAGE
+//!     dvd-embed extract  IMAGE_FILE             (数据写到 stdout)
+//!     dvd-embed capacity DIS_ISO
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, IsTerminal, Read, Write};
@@ -378,7 +378,7 @@ fn capacity(dis_path: &Path, quiet: bool) -> Result<(u64, u64), String> {
 
 // ---------------- 命令行 ----------------
 #[derive(Parser)]
-#[command(name = "dvd-hide", version, about = "单文件 DVD 镜像数据填充")]
+#[command(name = "dvd-embed", version, about = "单文件 DVD 镜像数据填充")]
 struct Cli {
     /// 不显示进度
     #[arg(short, long, global = true)]
