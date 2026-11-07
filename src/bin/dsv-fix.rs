@@ -1,6 +1,9 @@
-//! dsv-balancer：DVD 图案镜像的 DSV 平衡 + 整盘 DSV 检查。
+//! dsv-fix：DVD 图案镜像的 DSV 直流偏置修复 + 整盘 DSV 检查。
 //!
-//! run    把镜像过一遍，消除杀手字节（每扇区首字节 + 每 0x92 run 首字节塞 guard）
+//! run --method 1|2|3  三种修复方法（都先扰码到 Q 域，塞 guard 后再扰码回 P 域）：
+//!   1 = guard-runs：Q 域 0x92 连段首字节（>= --min）+ 扇区首字节塞 0x9B
+//!   2 = guard-16：Q 域每隔 16 字节塞 0x9B（0xA5 除外）
+//!   3 = bridge：原始方法（扇区首字节 + 0x92 run 首字节，密度启发式）
 //! check  对整盘每个 ECC block 计算峰值 |DSV|（含头/EDC/ECC/EFM+），找出仍超阈值的块
 //!
 //! DSV 计算是 dsv_block.py 的忠实移植（ECMA-267：扰码 + Reed-Solomon PI/PO + EDC +
@@ -42,6 +45,74 @@ fn build_chunk_mask(period: &[u8]) -> Vec<u8> {
         v.extend_from_slice(&period[..take]);
     }
     v
+}
+
+// ==================== 方法 1/2：guard-runs / guard-16 ====================
+const RUN_BYTE: u8 = 0x92;
+const GUARD: u8 = 0x9B;
+const BLACK: u8 = 0xA5;
+const GUARD16_STEP: usize = 16;
+
+/// 整盘扰码（XOR 掩码，自逆）。掩码以 512KiB 为周期，preset = block & 0xF。
+fn scramble(data: &mut [u8]) {
+    let m = masks();
+    for (block_idx, chunk) in data.chunks_mut(BLOCK).enumerate() {
+        let mask = &m[block_idx & 0xF];
+        for sector in chunk.chunks_mut(SECTOR) {
+            for (b, &mb) in sector.iter_mut().zip(mask.iter()) {
+                *b ^= mb;
+            }
+        }
+    }
+}
+
+/// 方法1：把每个长度 >= min_run 的连续 0x92 段的首字节替换成 0x9B。
+fn guard_runs(data: &mut [u8], min_run: usize) -> usize {
+    let mut replaced = 0;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == RUN_BYTE {
+            let start = i;
+            while i < data.len() && data[i] == RUN_BYTE {
+                i += 1;
+            }
+            if i - start >= min_run {
+                data[start] = GUARD;
+                replaced += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    replaced
+}
+
+/// 方法1：把所有扇区首字节（% 2048 == 0）置为 0x9B。
+fn guard_sectors(data: &mut [u8]) -> usize {
+    let mut changed = 0;
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] != GUARD {
+            data[i] = GUARD;
+            changed += 1;
+        }
+        i += SECTOR;
+    }
+    changed
+}
+
+/// 方法2：每隔 16 字节塞 0x9B（0xA5 除外）。
+fn guard_every16(data: &mut [u8]) -> usize {
+    let mut changed = 0;
+    for i in (0..data.len()).step_by(GUARD16_STEP) {
+        if data[i] != BLACK {
+            if data[i] != GUARD {
+                changed += 1;
+            }
+            data[i] = GUARD;
+        }
+    }
+    changed
 }
 
 // ==================== GF(256) + Reed-Solomon ====================
@@ -473,7 +544,7 @@ fn process_chunk(chunk: &mut [u8], mask: &[u8], guard: u8, window: usize, min_pa
 
 // ==================== CLI ====================
 #[derive(Parser)]
-#[command(name = "dsv-balancer", version, about = "DVD 图案镜像 DSV 平衡与检查")]
+#[command(name = "dsv-fix", version, about = "DVD 图案镜像 DSV 修复与检查")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -481,10 +552,17 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 平衡 DSV：每扇区首字节 + 每个 0x92 run 首字节塞 guard
+    /// 修复 DSV：--method 1=guard-runs 2=guard-16 3=bridge(原始)
     Run {
         input: PathBuf,
         output: PathBuf,
+        /// 修复方法：1=guard-runs 2=guard-16 3=bridge
+        #[arg(long, default_value_t = 1)]
+        method: u8,
+        /// 方法1：连续 0x92 至少 N 个才替换其首字节
+        #[arg(long, default_value_t = 16)]
+        min: usize,
+        /// 方法3：guard 字节
         #[arg(long, default_value = "9B")]
         guard: String,
         #[arg(long, default_value_t = 64)]
@@ -509,8 +587,8 @@ enum Command {
 
 fn main() {
     match Cli::parse().command {
-        Command::Run { input, output, guard, window, min_pattern, jobs } => {
-            run_bridge(&input, &output, &guard, window, min_pattern, jobs);
+        Command::Run { input, output, method, min, guard, window, min_pattern, jobs } => {
+            run_fix(&input, &output, method, min, &guard, window, min_pattern, jobs);
         }
         Command::Check { input, threshold, limit, jobs } => {
             run_check(&input, threshold, limit, jobs);
@@ -535,6 +613,41 @@ fn spawn_progress(total: usize, done: &Arc<AtomicUsize>) -> Option<std::thread::
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }))
+}
+
+fn run_fix(input: &PathBuf, output: &PathBuf, method: u8, min: usize, guard: &str, window: usize, min_pattern: f64, jobs: usize) {
+    match method {
+        1 => run_guard_runs(input, output, min),
+        2 => run_guard_every16(input, output),
+        3 => run_bridge(input, output, guard, window, min_pattern, jobs),
+        _ => {
+            eprintln!("错误: --method 只能是 1/2/3");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn run_guard_runs(input: &PathBuf, output: &PathBuf, min_run: usize) {
+    let mut data = std::fs::read(input).expect("读入失败");
+    scramble(&mut data);
+    let runs = guard_runs(&mut data, min_run);
+    let sectors = guard_sectors(&mut data);
+    scramble(&mut data);
+    std::fs::write(output, &data).expect("写出失败");
+    let total_sectors = data.len().div_ceil(SECTOR);
+    println!("处理了 {total_sectors} 个扇区：{} -> {}", input.display(), output.display());
+    println!("  Q 域 0x92 连段首字节替换（长度 >= {min_run}）: {runs} 处");
+    println!("  Q 域扇区首字节置 0x9B: {sectors} 处");
+}
+
+fn run_guard_every16(input: &PathBuf, output: &PathBuf) {
+    let mut data = std::fs::read(input).expect("读入失败");
+    scramble(&mut data);
+    let changed = guard_every16(&mut data);
+    scramble(&mut data);
+    std::fs::write(output, &data).expect("写出失败");
+    println!("处理了 {} 字节：{} -> {}", data.len(), input.display(), output.display());
+    println!("  Q 域每隔 16 字节塞 0x9B（0xA5 除外）: {changed} 处");
 }
 
 fn run_bridge(input: &PathBuf, output: &PathBuf, guard: &str, window: usize, min_pattern: f64, jobs: usize) {
